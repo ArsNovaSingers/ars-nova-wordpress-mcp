@@ -174,7 +174,26 @@ function mapHttpError(response: AxiosResponse<unknown>): Error {
   const status = response.status;
   const body = response.data as Record<string, unknown> | undefined;
   const wpCode = typeof body?.code === "string" ? body.code : undefined;
-  const wpMessage = typeof body?.message === "string" ? body.message : undefined;
+
+  // A WP_Error serialises as { code, message }. Our own plugins (ars-nova-ops,
+  // ars-nova-media) answer a failed write with a WP_REST_Response carrying
+  // { ok:false, error, messages } instead, which matches NEITHER field - so
+  // every one of those failures used to arrive here as a bare "HTTP 500" while
+  // the server had already named the cause. Six plugin installs were once
+  // diagnosed blind because of exactly this. Read both shapes.
+  const wpMessage =
+    typeof body?.message === "string" ? body.message :
+    typeof body?.error === "string" ? body.error :
+    undefined;
+
+  // ars-nova-ops returns the WP_Upgrader step log in `messages`. It is the part
+  // that says WHICH step failed ("Downloading...", "Unpacking...", "Destination
+  // folder already exists"), so it is worth more than the summary line.
+  const wpDetail = Array.isArray(body?.messages) && body.messages.length
+    ? " Detail: " + body.messages
+        .map((m) => String(m).replace(/&#8230;/g, "...").replace(/<[^>]+>/g, ""))
+        .join(" | ")
+    : "";
 
   switch (status) {
     case 401:
@@ -187,7 +206,7 @@ function mapHttpError(response: AxiosResponse<unknown>): Error {
     case 403:
       return new Error(
         `Permission denied (HTTP 403). Your WP user lacks the capability for this ` +
-        `endpoint. ${wpCode ? `WP error: ${wpCode}` : ""}${wpMessage ? ` — ${wpMessage}` : ""}`
+        `endpoint. ${wpCode ? `WP error: ${wpCode}` : ""}${wpMessage ? ` — ${wpMessage}` : ""}${wpDetail}`
       );
     case 404:
       return new Error(
@@ -200,7 +219,7 @@ function mapHttpError(response: AxiosResponse<unknown>): Error {
     default:
       return new Error(
         `WordPress API returned HTTP ${status}.${wpCode ? ` Code: ${wpCode}` : ""}` +
-        `${wpMessage ? ` Message: ${wpMessage}` : ""}`
+        `${wpMessage ? ` Message: ${wpMessage}` : ""}${wpDetail}`
       );
   }
 }

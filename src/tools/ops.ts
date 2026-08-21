@@ -12,13 +12,21 @@
  *   - url      : a zip URL on an allow-listed host (the site itself, github.com +
  *                *.githubusercontent.com, drive.google.com, docs.google.com, ...)
  *   - zip_b64  : a base64-encoded plugin zip
- *   - zip_path : a path to a plugin zip ON THIS COMPUTER — the connector reads it
- *                and pushes it as zip_b64 for you (best for our own custom plugins)
+ *   - drive_file_id : a Google Drive file id, fetched server-side and AUTHENTICATED
+ *                via ars-nova-google-connector's service account. This is how paid
+ *                third-party plugin zips are installed; the Drive folder stays
+ *                private (a Drive SHARE LINK does not work as a `url` — Drive
+ *                serves servers differently than browsers).
+ *
+ * zip_path was REMOVED in this revision. It called readFileSync() on the machine
+ * running this server. That was Jonathan's PC when the connector ran locally; it
+ * has been a Cloud Run container since, where his paths do not exist. It could
+ * therefore never succeed, and it failed as a bare ENOENT on a path he could see
+ * in Explorer. Use drive_file_id (vendor zips) or url (our own GitHub releases).
  *
  * Requires the companion plugin to be active on the target site. A 404 means it
  * isn't installed/active yet.
  */
-import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -37,33 +45,23 @@ const INSTALL_TIMEOUT_MS = 120_000;
 
 /**
  * Resolve the four source options into a request body with exactly one source.
- * Reads zip_path from local disk and converts it to zip_b64.
  */
 function buildSourceBody(params: Record<string, unknown>): Record<string, unknown> {
   const slug = typeof params.slug === "string" ? params.slug.trim() : "";
   const url = typeof params.url === "string" ? params.url.trim() : "";
   const zip_b64 = typeof params.zip_b64 === "string" ? params.zip_b64 : "";
-  const zip_path = typeof params.zip_path === "string" ? params.zip_path.trim() : "";
+  const drive_file_id = typeof params.drive_file_id === "string" ? params.drive_file_id.trim() : "";
 
-  const provided = [slug, url, zip_b64, zip_path].filter((v) => v !== "").length;
+  const provided = [slug, url, zip_b64, drive_file_id].filter((v) => v !== "").length;
   if (provided !== 1) {
-    throw new Error("Provide exactly one source: slug, url, zip_b64, or zip_path.");
+    throw new Error("Provide exactly one source: slug, url, zip_b64, or drive_file_id.");
   }
 
   const body: Record<string, unknown> = {};
   if (slug) body.slug = slug;
   else if (url) body.url = url;
   else if (zip_b64) body.zip_b64 = zip_b64;
-  else {
-    // Read the local zip and base64-encode it.
-    let buf: Buffer;
-    try {
-      buf = readFileSync(zip_path);
-    } catch (e) {
-      throw new Error(`Could not read zip_path "${zip_path}": ${e instanceof Error ? e.message : String(e)}`);
-    }
-    body.zip_b64 = buf.toString("base64");
-  }
+  else body.drive_file_id = drive_file_id;
 
   if (params.activate !== undefined) body.activate = params.activate;
   if (params.overwrite !== undefined) body.overwrite = params.overwrite;
@@ -75,7 +73,7 @@ const SOURCE_SCHEMA = {
   slug: z.string().optional().describe("Install from the WordPress.org directory by slug (public plugins only)."),
   url: z.string().optional().describe("Zip URL on an allow-listed host (site itself, github.com/*.githubusercontent.com, drive.google.com, docs.google.com)."),
   zip_b64: z.string().optional().describe("Base64-encoded plugin zip."),
-  zip_path: z.string().optional().describe("Path to a plugin zip ON THIS COMPUTER; the connector reads + encodes it for you. Best for our own custom plugins."),
+  drive_file_id: z.string().optional().describe("Google Drive file id of a plugin zip. Fetched server-side with the site's own service account, so the Drive folder stays private. This is the route for paid third-party plugin zips (Website Admin > _Installers). A Drive share link passed as `url` does NOT work."),
 };
 
 export function registerOpsTools(server: McpServer): void {
@@ -108,11 +106,15 @@ the allow-listed zip hosts. Call before installing/updating plugins.`,
     {
       title: "Install Plugin",
       description: `Install a plugin on the target WordPress site. Pick ONE source: slug (from
-WordPress.org), url (allow-listed zip), zip_b64, or zip_path (a local zip file
-the connector reads for you). Set activate=true to activate right after install.
-For updating an already-installed plugin, use wp_update_plugin instead (or pass
-overwrite=true here). On the LIVE production site this refuses unless
-confirm_production=true.`,
+WordPress.org), url (allow-listed zip, e.g. one of our GitHub release assets),
+zip_b64, or drive_file_id (a vendor zip in the private _Installers Drive folder).
+Set activate=true to activate right after install. For updating an
+already-installed plugin, use wp_update_plugin instead (or pass overwrite=true
+here). On the LIVE production site this refuses unless confirm_production=true.
+
+Requires ars-nova-ops v1.2.1 or later on the target site: before that release an
+install over an ALREADY-INSTALLED wordpress.org plugin always failed with a bare
+HTTP 500, because the overwrite flag was discarded for slug sources.`,
       inputSchema: {
         ...SOURCE_SCHEMA,
         activate: z.boolean().optional().describe("Activate the plugin immediately after install."),
@@ -139,9 +141,9 @@ confirm_production=true.`,
     {
       title: "Update Plugin",
       description: `Update / replace an already-installed plugin in place (overwrite forced on).
-Pick ONE source: slug, url, zip_b64, or zip_path (a local zip the connector
-reads for you). Keeps the plugin's activation state. On the LIVE production
-site this refuses unless confirm_production=true.`,
+Pick ONE source: slug, url, zip_b64, or drive_file_id. Keeps the plugin's
+activation state. On the LIVE production site this refuses unless
+confirm_production=true.`,
       inputSchema: {
         ...SOURCE_SCHEMA,
         activate: z.boolean().optional().describe("Ensure the plugin is active after updating."),

@@ -1,10 +1,15 @@
 /**
  * ars-nova-wordpress-mcp — Streamable HTTP entry point (Cloud Run).
  *
- * Same tools as stdio; different transport. Gated by MCP_AUTH_TOKEN, supplied
- * either as `?key=` on the URL or an `Authorization: Bearer` header. The
- * query-param form is not a shortcut - Claude's custom-connector UI has no
- * static header field (anthropics/claude-ai-mcp#112, closed "not planned").
+ * Same tools as stdio; different transport. Gated by a token supplied either as an
+ * `Authorization: Bearer` header (PREFERRED) or `?key=` on the URL.
+ *
+ * ⚠️ Corrected 2026-09-01: this comment previously said the query-param form existed
+ * because Claude's custom-connector UI has no static header field
+ * (anthropics/claude-ai-mcp#112, closed "not planned"). That is FALSE - the
+ * Add-custom-connector dialog has a "Request headers" section taking up to four
+ * headers. Prefer the header: a token in `?key=` is written to the Cloud Run request
+ * log in plaintext, and a header is not. `?key=` is kept only for existing configs.
  *
  * Callers may present either the shared MCP_AUTH_TOKEN (which acts as the env-var
  * WordPress account, unchanged) or their own token from MCP_AUTH_IDENTITIES, which

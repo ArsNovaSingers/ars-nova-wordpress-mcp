@@ -16,9 +16,21 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { DEFAULT_TIMEOUT_MS, WP_REST_NAMESPACE } from "../constants.js";
+import { identityStore } from "../auth.js";
 
 let cachedClient: AxiosInstance | null = null;
 let cachedSiteUrl: string | null = null;
+
+/**
+ * Per-identity clients, keyed by WordPress username.
+ *
+ * The HTTP transport is stateless - a fresh server per request - but this module is
+ * not: the axios instance below is a module-level singleton. So the caller's identity
+ * cannot be a constructor argument without threading it through every one of the ~20
+ * tool modules. Instead http.ts puts it in an AsyncLocalStorage and this function
+ * reads it, which keeps the change to two files and leaves every tool untouched.
+ */
+const identityClients = new Map<string, AxiosInstance>();
 
 /**
  * Read and validate required environment variables. Throws on first failure
@@ -59,8 +71,35 @@ function readEnvConfig(): {
   };
 }
 
-/** Lazy singleton: build the axios client on first use. */
+/**
+ * Lazy singleton: build the axios client on first use.
+ *
+ * When the current request carries a per-caller identity (see auth.ts), returns a
+ * client authenticated as THAT WordPress user instead of the env-var account, so the
+ * edit is attributed to the real person and limited by their own WordPress role.
+ * Falls back to the shared env-var credentials on stdio and for legacy-token callers.
+ */
 export function getWpClient(): AxiosInstance {
+  const identity = identityStore.getStore();
+  if (identity) {
+    const existing = identityClients.get(identity.wpUsername);
+    if (existing) return existing;
+
+    // Site URL is per-deployment, not per-user, so it still comes from env.
+    const { siteUrl } = readEnvConfig();
+    cachedSiteUrl = siteUrl;
+
+    const client = axios.create({
+      baseURL: `${siteUrl}/wp-json`,
+      timeout: DEFAULT_TIMEOUT_MS,
+      headers: { Accept: "application/json" },
+      auth: { username: identity.wpUsername, password: identity.wpAppPassword },
+      validateStatus: () => true,
+    });
+    identityClients.set(identity.wpUsername, client);
+    return client;
+  }
+
   if (cachedClient) return cachedClient;
 
   const { siteUrl, username, appPassword } = readEnvConfig();

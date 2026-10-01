@@ -28,6 +28,7 @@ import { registerTickeraTools } from "./tools/tickera.js";
 import { registerOpsTools } from "./tools/ops.js";
 import { registerRedirectionTools } from "./tools/redirection.js";
 import { registerPassthroughTools } from "./tools/passthrough.js";
+import { registerFeaturedImageTools } from "./tools/featured-image.js";
 
 export function validateEnvOrExit(): void {
   const missing = REQUIRED_ENV_VARS.filter((v) => !process.env[v]?.trim());
@@ -72,6 +73,7 @@ export function createServer(): McpServer {
   registerOpsTools(server);
   registerRedirectionTools(server);
   registerPassthroughTools(server);
+  registerFeaturedImageTools(server);
 
   return server;
 }

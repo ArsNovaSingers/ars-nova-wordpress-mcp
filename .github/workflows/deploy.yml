@@ -1,0 +1,75 @@
+# Deploys the WordPress connector to Cloud Run (project ars-nova-org-mcp).
+#
+#   push to main            -> ans-wordpress-staging
+#   Run workflow, staging   -> ans-wordpress-staging
+#   Run workflow, live      -> ans-wordpress-live   (the LIVE site: real ticket sales)
+#
+# Same model as the plugin pipeline (ans-release-workflows): merge deploys staging,
+# a person promotes to Live by hand. Promote the commit you tested on staging: run it
+# from main when main is still the commit staging got.
+#
+# Auth is Workload Identity Federation: no key is stored anywhere. The provider only
+# accepts tokens from this repo on refs/heads/main, so branches, forks and PRs cannot
+# deploy (this repo is public).
+#
+# A source deploy KEEPS each service's env vars (WP_SITE_URL, WP_ENV_LABEL, tokens),
+# secret mounts and service account. Never add --set-env-vars here, and never run a bare
+# `gcloud run services describe`: env vars hold credentials and this run log is public.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "staging, or live (the public site)"
+        type: choice
+        options: [staging, live]
+        default: staging
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  PROJECT: ars-nova-org-mcp
+  REGION: us-central1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'live') && 'live' || 'staging' }}
+    env:
+      SERVICE: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'live') && 'ans-wordpress-live' || 'ans-wordpress-staging' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Target
+        run: echo "Deploying commit $GITHUB_SHA to $SERVICE"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/832822761458/locations/global/workloadIdentityPools/github/providers/github
+          service_account: gh-actions-deployer@ars-nova-org-mcp.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy from source
+        run: gcloud run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" --source . --quiet
+
+      - name: Serving revision (named fields only)
+        run: gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format="value(status.latestReadyRevisionName,status.url)"
+
+      - name: Smoke test - health 200, and /mcp with no token must give 401
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format="value(status.url)")
+          H=$(curl -s -o /dev/null -w '%{http_code}' "$URL/")
+          M=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/mcp" -H 'content-type: application/json' -d '{}')
+          echo "GET / -> $H, POST /mcp (no token) -> $M"
+          [ "$H" = "200" ] && [ "$M" = "401" ]

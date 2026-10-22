@@ -194,6 +194,40 @@ async function putForm(formId: number, form: GfForm): Promise<GfForm> {
   return getForm(formId);
 }
 
+type GfEntry = Record<string, unknown> & { id?: number | string; form_id?: number | string };
+
+async function getEntry(entryId: number): Promise<GfEntry> {
+  const r = await makeApiRequest<GfEntry>(`${GF_NS}/entries/${entryId}`, "GET");
+  return r.data;
+}
+
+/** Field id/label -> the entry keys it owns ("5", or "2.1".."2.6" for a multi-input field). */
+function fieldKeys(form: GfForm): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const f of form.fields ?? []) {
+    const inputs = (f as { inputs?: Array<{ id: string | number }> }).inputs;
+    const keys = Array.isArray(inputs) && inputs.length ? inputs.map((i) => String(i.id)) : [String(f.id)];
+    out.set(String(f.id), keys);
+    for (const k of keys) out.set(k, [k]);
+    if (f.label) out.set(String(f.label), keys);
+    if (f.adminLabel) out.set(String(f.adminLabel), keys);
+  }
+  return out;
+}
+
+function labelledAnswers(form: GfForm, e: GfEntry): Record<string, string> {
+  const labels = new Map<string, string>();
+  for (const f of form.fields ?? []) labels.set(String(f.id), String(f.adminLabel || f.label || f.id));
+  const answers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(e)) {
+    const m = /^(\d+)(?:\.\d+)?$/.exec(k);
+    if (!m || v === "" || v === null || v === undefined) continue;
+    const label = labels.get(m[1]) ?? k;
+    answers[label] = answers[label] ? `${answers[label]}, ${String(v)}` : String(v);
+  }
+  return answers;
+}
+
 function render(form: GfForm, fmt: ResponseFormat | undefined, heading: string) {
   const s = summarize(form);
   const text = fmt === ResponseFormat.JSON
@@ -264,6 +298,21 @@ const ListEntriesSchema = z.object({
   page: z.number().int().min(1).default(1),
   status: z.enum(["active", "spam", "trash"]).default("active"),
   response_format: ResponseFormatField,
+}).strict();
+
+const GetEntrySchema = z.object({
+  entry_id: z.number().int().positive(),
+  response_format: ResponseFormatField,
+}).strict();
+
+const UpdateEntrySchema = z.object({
+  entry_id: z.number().int().positive(),
+  values: z.record(z.string()).optional().describe(
+    "Answers to change, keyed by field id (\"5\", or \"2.3\" for one part of a name/address/checkbox field) or by the field's exact label / admin label. Only these change; everything else on the entry is kept."
+  ),
+  status: z.enum(["active", "spam", "trash"]).optional().describe("Move the entry to active / spam / trash."),
+  is_starred: z.boolean().optional(),
+  is_read: z.boolean().optional(),
 }).strict();
 
 // -----------------------------------------------------------------------------
@@ -498,6 +547,76 @@ Deleting a field also hides that field's answers in existing entries — check g
             entries.map((e) => `## Entry ${e.id} · ${e.created}\n` +
               Object.entries(e.answers).map(([k, v]) => `- **${k}:** ${v}`).join("\n")).join("\n\n");
         return toolResult(text, { total, page: p.page, entries });
+      } catch (e) {
+        return toolError(errMsg(e));
+      }
+    }
+  );
+  server.registerTool(
+    "gf_get_entry",
+    {
+      title: "Get One Gravity Form Entry",
+      description: "Read one submission by entry id: its answers labelled by field label, plus its properties (form, date, status, read/starred, source page).",
+      inputSchema: GetEntrySchema.shape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (p: z.infer<typeof GetEntrySchema>) => {
+      try {
+        const e = await getEntry(p.entry_id);
+        const form = await getForm(Number(e.form_id));
+        const answers = labelledAnswers(form, e);
+        const props = {
+          id: e.id, form_id: e.form_id, form_title: form.title, date_created: e.date_created, date_updated: e.date_updated,
+          status: e.status, is_read: e.is_read, is_starred: e.is_starred, source_url: e.source_url, created_by: e.created_by,
+        };
+        const text = p.response_format === ResponseFormat.JSON
+          ? JSON.stringify({ ...props, answers }, null, 2)
+          : `# Entry ${e.id} · "${form.title}" · ${e.date_created} · ${e.status}\n\n` +
+            Object.entries(answers).map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+        return toolResult(text, { ...props, answers });
+      } catch (e) {
+        return toolError(errMsg(e));
+      }
+    }
+  );
+
+  server.registerTool(
+    "gf_update_entry",
+    {
+      title: "Update a Gravity Form Entry",
+      description: `Change answers on one submission, or move it to spam / trash, or mark it read / starred. Only what you pass changes.
+
+Why this reads the entry first: in Gravity Forms 3.1.3, PUT gf/v2/entries/{id} hands the body to GFAPI::update_entry(), which DELETES every field value the body leaves out and resets date_created, IP, source page, read/starred and payment properties to defaults (verified in includes/api.php on the server, 2026-10-21). So this tool reads the full entry, merges your changes onto it and sends the whole entry back.
+
+values are keyed by field id ("5", "2.3") or the field's exact label / admin label. A label that matches a multi-input field (name, address, checkbox) must instead name the sub-input id, e.g. "2.3". Unknown keys are refused rather than guessed.`,
+      inputSchema: UpdateEntrySchema.shape,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (p: z.infer<typeof UpdateEntrySchema>) => {
+      try {
+        const current = await getEntry(p.entry_id);
+        const form = await getForm(Number(current.form_id));
+        const keys = fieldKeys(form);
+        const merged: GfEntry = { ...current };
+        const changed: Record<string, { from: unknown; to: unknown }> = {};
+        for (const [k, v] of Object.entries(p.values ?? {})) {
+          const target = keys.get(k);
+          if (!target) return toolError(`No field "${k}" on form ${current.form_id} ("${form.title}"). Use a field id from gf_get_form, or its exact label.`);
+          if (target.length !== 1) return toolError(`"${k}" is a multi-input field; name the part instead (one of ${target.join(", ")}).`);
+          changed[target[0]] = { from: current[target[0]] ?? "", to: v };
+          merged[target[0]] = v;
+        }
+        if (p.status !== undefined) { changed.status = { from: current.status, to: p.status }; merged.status = p.status; }
+        if (p.is_starred !== undefined) { changed.is_starred = { from: current.is_starred, to: p.is_starred ? 1 : 0 }; merged.is_starred = p.is_starred ? 1 : 0; }
+        if (p.is_read !== undefined) { changed.is_read = { from: current.is_read, to: p.is_read ? 1 : 0 }; merged.is_read = p.is_read ? 1 : 0; }
+        if (!Object.keys(changed).length) return toolError("Nothing to change: pass values, status, is_starred or is_read.");
+        await makeApiRequest<GfEntry>(`${GF_NS}/entries/${p.entry_id}`, "PUT", undefined, merged as Record<string, unknown>);
+        const after = await getEntry(p.entry_id);
+        const lost = Object.keys(current).filter((k) => /^\d+(\.\d+)?$/.test(k) && !(k in changed) && String(current[k] ?? "") !== "" && String(after[k] ?? "") !== String(current[k]));
+        const text = `Entry ${p.entry_id} updated.\n` +
+          Object.entries(changed).map(([k, c]) => `- ${k}: "${String(c.from)}" -> "${String(c.to)}"`).join("\n") +
+          (lost.length ? `\n\nWARNING: these other values changed unexpectedly: ${lost.join(", ")}` : "");
+        return toolResult(text, { entry_id: p.entry_id, changed, unexpected: lost });
       } catch (e) {
         return toolError(errMsg(e));
       }

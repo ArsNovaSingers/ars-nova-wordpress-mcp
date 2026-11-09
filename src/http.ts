@@ -15,22 +15,45 @@
  * WordPress account, unchanged) or their own token from MCP_AUTH_IDENTITIES, which
  * acts as their own WordPress user. See auth.ts.
  *
+ * 2026-11-09 (INFRA-15): optional Google sign-in (oauth.ts), so the connector can be added
+ * at the Claude ORG level and used from any surface. Tokens above keep working alongside it.
+ * An OAuth user acts as the MCP_AUTH_IDENTITIES entry whose "email" matches; unmapped
+ * emails are refused unless OAUTH_UNMAPPED=shared.
+ *
  * Env: WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD, WP_ENV_LABEL, PORT,
- *      and at least one of MCP_AUTH_TOKEN / MCP_AUTH_IDENTITIES
+ *      at least one of MCP_AUTH_TOKEN / MCP_AUTH_IDENTITIES / OAuth, where OAuth is all of
+ *      PUBLIC_URL, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, OAUTH_SECRET,
+ *      OAUTH_ALLOWED_DOMAIN (all or none), plus optional OAUTH_UNMAPPED=deny|shared and OAUTH_SHARED_EMAILS
  */
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  mcpAuthRouter,
+  getOAuthProtectedResourceMetadataUrl,
+} from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 
 import { SERVER_NAME, SERVER_VERSION } from "./constants.js";
 import { createServer, validateEnvOrExit } from "./server.js";
 import {
   authenticate,
+  authenticateEmail,
   hasAnyCredential,
   identityLabels,
   identityStore,
   loadAuthConfig,
+  oauthEmails,
+  oauthUnmappedPolicy,
+  type AuthResult,
   type WpIdentity,
 } from "./auth.js";
+import {
+  GoogleOAuthProvider,
+  OAUTH_SCOPE,
+  googleCallbackRouter,
+  loadOAuthConfig,
+  type OAuthConfig,
+} from "./oauth.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const ENV_LABEL = process.env.WP_ENV_LABEL || "unlabelled";
@@ -39,17 +62,21 @@ validateEnvOrExit();
 
 // Throws (and so refuses to boot) on malformed MCP_AUTH_IDENTITIES, rather than
 // starting up and rejecting every request for a reason nobody can see.
+let oauthConfig: OAuthConfig | undefined;
+let oauthProvider: GoogleOAuthProvider | undefined;
 try {
   loadAuthConfig();
+  oauthConfig = loadOAuthConfig();
+  oauthProvider = oauthConfig ? new GoogleOAuthProvider(oauthConfig) : undefined;
 } catch (err) {
   console.error(`[${SERVER_NAME}] FATAL: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 }
 
-if (!hasAnyCredential()) {
+if (!hasAnyCredential() && !oauthProvider) {
   console.error(
-    `[${SERVER_NAME}] FATAL: neither MCP_AUTH_TOKEN nor MCP_AUTH_IDENTITIES is set. ` +
-    `Refusing to expose WordPress write access on an unauthenticated endpoint.`
+    `[${SERVER_NAME}] FATAL: no MCP_AUTH_TOKEN, no token in MCP_AUTH_IDENTITIES, and OAuth is not ` +
+    `configured. Refusing to expose WordPress write access on an unauthenticated endpoint.`
   );
   process.exit(1);
 }
@@ -71,23 +98,74 @@ app.get("/", (_req: Request, res: Response) => {
     .send(`${SERVER_NAME} v${SERVER_VERSION} [${ENV_LABEL}] — MCP endpoint: POST /mcp`);
 });
 
-// Claude probes these when adding a connector. 401 pushes it off the OAuth
-// path and onto the token-in-URL path.
-app.all(/^\/\.well-known\/.*/, (_req: Request, res: Response) => {
-  res.status(401).end();
-});
+if (oauthProvider && oauthConfig) {
+  // OAuth mode (INFRA-15): serves /.well-known/*, /register, /authorize, /token.
+  app.set("trust proxy", 1); // Cloud Run fronts us; the SDK's rate limiter keys on client IP
+  app.use(
+    mcpAuthRouter({
+      provider: oauthProvider,
+      issuerUrl: new URL(oauthConfig.publicUrl),
+      resourceServerUrl: new URL(oauthProvider.resourceUrl),
+      resourceName: `Ars Nova WordPress (${ENV_LABEL})`,
+      scopesSupported: [OAUTH_SCOPE],
+      clientRegistrationOptions: { clientIdGeneration: false }, // oauth.ts seals the registration into the id
+    })
+  );
+  app.use(googleCallbackRouter(oauthProvider));
+} else {
+  // Token-only mode: Claude probes these when adding a connector. 401 pushes it off
+  // the OAuth path and onto the token path.
+  app.all(/^\/\.well-known\/.*/, (_req: Request, res: Response) => {
+    res.status(401).end();
+  });
+}
 
-app.post("/mcp", async (req: Request, res: Response) => {
-  const auth = authenticate(presentedToken(req));
-  if (!auth.ok) {
-    console.error(`[${SERVER_NAME}] unauthorized /mcp attempt from ${req.ip}`);
-    res.status(401).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "Unauthorized" },
-      id: null,
-    });
+const bearer = oauthProvider
+  ? requireBearerAuth({
+      verifier: oauthProvider,
+      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(new URL(oauthProvider.resourceUrl)),
+    })
+  : undefined;
+
+function unauthorized(req: Request, res: Response): void {
+  console.error(`[${SERVER_NAME}] unauthorized /mcp attempt from ${req.ip}`);
+  res.status(401).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Unauthorized" },
+    id: null,
+  });
+}
+
+/**
+ * Resolves WHO is calling into res.locals.auth. A static token (shared or per-person)
+ * is tried first, so existing connector configs keep working unchanged; anything else
+ * goes to the OAuth bearer check, whose 401 carries the WWW-Authenticate header Claude
+ * needs to start sign-in.
+ */
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const byToken = authenticate(presentedToken(req));
+  if (byToken.ok) {
+    res.locals.auth = byToken;
+    next();
     return;
   }
+  if (!bearer) {
+    unauthorized(req, res);
+    return;
+  }
+  bearer(req, res, (err?: unknown) => {
+    if (err) return next(err);
+    const email = req.auth?.extra?.email;
+    if (typeof email !== "string") return unauthorized(req, res);
+    const byEmail = authenticateEmail(email);
+    if (!byEmail.ok) return unauthorized(req, res);
+    res.locals.auth = byEmail;
+    next();
+  });
+}
+
+app.post("/mcp", requireAuth, async (req: Request, res: Response) => {
+  const auth = res.locals.auth as Extract<AuthResult, { ok: true }>;
 
   // Log WHO, never the token. Before this existed, every action on the site was
   // attributable only to one shared WordPress account.
@@ -144,5 +222,12 @@ app.listen(PORT, () => {
     `[${SERVER_NAME}] v${SERVER_VERSION} [${ENV_LABEL}] listening on :${PORT} ` +
     `-> ${process.env.WP_SITE_URL} ` +
     `(identities: ${identityLabels().join(", ") || "none"})`
+  );
+  console.error(
+    `[${SERVER_NAME}] OAuth ${oauthProvider ? "ON" : "off"}` +
+    (oauthProvider
+      ? ` (domain ${oauthConfig!.allowedDomain}; mapped: ${oauthEmails().join(", ") || "none"}; ` +
+        `unmapped: ${oauthUnmappedPolicy()})`
+      : "")
   );
 });

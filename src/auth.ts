@@ -39,6 +39,21 @@ export const identityStore = new AsyncLocalStorage<WpIdentity>();
 /** token -> identity. Built once at startup, like the token it supplements. */
 const identities = new Map<string, WpIdentity>();
 
+/**
+ * Google-signed-in email -> identity. Filled from the optional `email` field of
+ * MCP_AUTH_IDENTITIES entries. An entry may have an email and no token, which makes it
+ * reachable ONLY through OAuth.
+ */
+const emailIdentities = new Map<string, WpIdentity>();
+
+/**
+ * What an OAuth user whose email is NOT in MCP_AUTH_IDENTITIES gets.
+ *   "deny"   (default) - refused at sign-in. Fail closed: every org member does not
+ *                        automatically get the shared account's WordPress role.
+ *   "shared" - acts as the env-var WP_USERNAME account, like the legacy token.
+ */
+let unmappedPolicy: "deny" | "shared" = "deny";
+
 let legacyToken = "";
 let loaded = false;
 
@@ -71,6 +86,7 @@ export function loadAuthConfig(): void {
     parsed.forEach((entry, i) => {
       const e = entry as Record<string, unknown>;
       const token = typeof e?.token === "string" ? e.token.trim() : "";
+      const email = typeof e?.email === "string" ? e.email.trim().toLowerCase() : "";
       const wpUsername = typeof e?.wpUsername === "string" ? e.wpUsername.trim() : "";
       const wpAppPassword = typeof e?.wpAppPassword === "string" ? e.wpAppPassword.trim() : "";
       const label =
@@ -78,7 +94,28 @@ export function loadAuthConfig(): void {
 
       // Name the INDEX, not the value. An error message that echoes a token puts it
       // in the log, which is the exact failure this change is cleaning up after.
-      if (!token) throw new Error(`MCP_AUTH_IDENTITIES[${i}] is missing "token".`);
+      if (!token && !email) {
+        throw new Error(`MCP_AUTH_IDENTITIES[${i}] needs a "token", an "email", or both.`);
+      }
+      if (email) {
+        if (!email.includes("@")) {
+          throw new Error(`MCP_AUTH_IDENTITIES[${i}] ("${label}") has an invalid "email".`);
+        }
+        if (emailIdentities.has(email)) {
+          throw new Error(`MCP_AUTH_IDENTITIES[${i}] ("${label}") reuses an email already mapped.`);
+        }
+      }
+      if (!token) {
+        // OAuth-only identity: reachable by Google sign-in, never by a static token.
+        if (!wpUsername) {
+          throw new Error(`MCP_AUTH_IDENTITIES[${i}] ("${label}") is missing "wpUsername".`);
+        }
+        if (!wpAppPassword) {
+          throw new Error(`MCP_AUTH_IDENTITIES[${i}] ("${label}") is missing "wpAppPassword".`);
+        }
+        emailIdentities.set(email, { label, wpUsername, wpAppPassword });
+        return;
+      }
       if (token.length < 20) {
         throw new Error(
           `MCP_AUTH_IDENTITIES[${i}] ("${label}") has a token shorter than 20 characters.`
@@ -103,8 +140,15 @@ export function loadAuthConfig(): void {
       }
 
       identities.set(token, { label, wpUsername, wpAppPassword });
+      if (email) emailIdentities.set(email, { label, wpUsername, wpAppPassword });
     });
   }
+
+  const policy = (process.env.OAUTH_UNMAPPED || "deny").trim().toLowerCase();
+  if (policy !== "deny" && policy !== "shared") {
+    throw new Error(`OAUTH_UNMAPPED must be "deny" or "shared", got "${policy}".`);
+  }
+  unmappedPolicy = policy;
 
   loaded = true;
 }
@@ -128,6 +172,27 @@ function safeEqual(a: string, b: string): boolean {
   const bb = Buffer.from(b, "utf8");
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Resolve a Google-verified email (OAuth path). The domain check has already happened.
+ * Returns null when the email may not use this server.
+ */
+export function authenticateEmail(email: string): AuthResult {
+  const key = email.trim().toLowerCase();
+  const identity = emailIdentities.get(key);
+  if (identity) return { ok: true, identity, label: `${identity.label} <${key}>` };
+  if (unmappedPolicy === "shared") return { ok: true, identity: null, label: `shared <${key}>` };
+  return { ok: false };
+}
+
+/** Emails mapped for OAuth. Safe to log - contains no secrets. */
+export function oauthEmails(): string[] {
+  return [...emailIdentities.keys()];
+}
+
+export function oauthUnmappedPolicy(): string {
+  return unmappedPolicy;
 }
 
 export type AuthResult =

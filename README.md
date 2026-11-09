@@ -115,6 +115,20 @@ WordPress Application Passwords (built into WP 5.6+, no plugin required).
 Sent as Basic Auth on every request. Application Passwords can be revoked
 individually from the WP profile page without affecting the user's normal login.
 
+### Google sign-in (OAuth) for the hosted connector
+
+Added 2026-11-09 (INFRA-15) so the connector can be added at the Claude organisation level
+and used from web, desktop and phone. Set all five or none:
+`PUBLIC_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `OAUTH_SECRET`
+(32+ random bytes, base64) and `OAUTH_ALLOWED_DOMAIN`. Register
+`<PUBLIC_URL>/oauth/google/callback` as a redirect URI on the Google OAuth client.
+
+Who gets in: a verified Google account in the allowed domain **and** an
+`MCP_AUTH_IDENTITIES` entry with a matching `"email"`, whose WordPress Application Password
+the session then uses. An entry may have an email and no token (OAuth-only). Unmapped emails
+are refused unless `OAUTH_UNMAPPED=shared`, which acts as the env-var WordPress account.
+Static tokens keep working alongside OAuth.
+
 ## Project structure
 
 ```

@@ -126,7 +126,8 @@ and used from web, desktop and phone. Set all five or none:
 Who gets in: a verified Google account in the allowed domain **and** an
 `MCP_AUTH_IDENTITIES` entry with a matching `"email"`, whose WordPress Application Password
 the session then uses. An entry may have an email and no token (OAuth-only). Unmapped emails
-are refused unless `OAUTH_UNMAPPED=shared`, which acts as the env-var WordPress account.
+are refused unless listed in `OAUTH_SHARED_EMAILS` (comma-separated; they act as the env-var
+WordPress account) or `OAUTH_UNMAPPED=shared` (everyone in the domain does).
 Static tokens keep working alongside OAuth.
 
 ## Project structure

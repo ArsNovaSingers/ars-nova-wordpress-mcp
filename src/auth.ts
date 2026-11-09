@@ -54,6 +54,9 @@ const emailIdentities = new Map<string, WpIdentity>();
  */
 let unmappedPolicy: "deny" | "shared" = "deny";
 
+/** OAUTH_SHARED_EMAILS: these emails act as the env-var WordPress account. */
+const sharedEmails = new Set<string>();
+
 let legacyToken = "";
 let loaded = false;
 
@@ -150,6 +153,18 @@ export function loadAuthConfig(): void {
   }
   unmappedPolicy = policy;
 
+  // Emails that act as the env-var (shared) WordPress account over OAuth, without
+  // copying that account's app password into MCP_AUTH_IDENTITIES.
+  for (const raw of (process.env.OAUTH_SHARED_EMAILS || "").split(",")) {
+    const e = raw.trim().toLowerCase();
+    if (!e) continue;
+    if (!e.includes("@")) throw new Error(`OAUTH_SHARED_EMAILS has an invalid entry "${e}".`);
+    if (emailIdentities.has(e)) {
+      throw new Error(`${e} is in both OAUTH_SHARED_EMAILS and MCP_AUTH_IDENTITIES.`);
+    }
+    sharedEmails.add(e);
+  }
+
   loaded = true;
 }
 
@@ -182,13 +197,15 @@ export function authenticateEmail(email: string): AuthResult {
   const key = email.trim().toLowerCase();
   const identity = emailIdentities.get(key);
   if (identity) return { ok: true, identity, label: `${identity.label} <${key}>` };
-  if (unmappedPolicy === "shared") return { ok: true, identity: null, label: `shared <${key}>` };
+  if (sharedEmails.has(key) || unmappedPolicy === "shared") {
+    return { ok: true, identity: null, label: `shared <${key}>` };
+  }
   return { ok: false };
 }
 
 /** Emails mapped for OAuth. Safe to log - contains no secrets. */
 export function oauthEmails(): string[] {
-  return [...emailIdentities.keys()];
+  return [...emailIdentities.keys(), ...[...sharedEmails].map((e) => `${e} (shared)`)];
 }
 
 export function oauthUnmappedPolicy(): string {

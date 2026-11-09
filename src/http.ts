@@ -23,7 +23,7 @@
  * Env: WP_SITE_URL, WP_USERNAME, WP_APP_PASSWORD, WP_ENV_LABEL, PORT,
  *      at least one of MCP_AUTH_TOKEN / MCP_AUTH_IDENTITIES / OAuth, where OAuth is all of
  *      PUBLIC_URL, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, OAUTH_SECRET,
- *      OAUTH_ALLOWED_DOMAIN (all or none), plus optional OAUTH_UNMAPPED=deny|shared
+ *      OAUTH_ALLOWED_DOMAIN (all or none), plus optional OAUTH_UNMAPPED=deny|shared and OAUTH_SHARED_EMAILS
  */
 import express, { type NextFunction, type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";

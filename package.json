@@ -9,7 +9,8 @@
     "start:http": "node dist/http.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "tsx --test src/tools/media-sideload.test.ts"
   },
   "engines": {
     "node": ">=18"

@@ -76,6 +76,7 @@ If it returns the site name, tagline, and WP version, auth is working.
 ### Media
 - `wp_list_media` — list media library items
 - `wp_get_media_item` — fetch one media item with full metadata
+- `wp_upload_media` — add a file by `drive_file_id`, `source_url`, `base64_content` (+ `filename`, `sha256`) or `file_path`, with `alt_text`, `attach_to_post` and `set_featured_on[]`. Wraps `ans-ops/v1/media/sideload` in the site's **ars-nova-media 1.2.0+** plugin (20 MB, jpeg/png/webp/gif/svg/pdf). On the hosted connector `file_path` is the Cloud Run container, never your PC. Tests: `npm test`.
 
 ### Users
 - `wp_list_users` — list users and their roles

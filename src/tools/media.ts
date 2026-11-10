@@ -23,6 +23,12 @@ import {
   ResponseFormatField,
 } from "../schemas/common.js";
 import { ResponseFormat, type WPMediaItem } from "../types.js";
+import {
+  SIDELOAD_ROUTE,
+  formatSideloadMarkdown,
+  planUpload,
+  type SideloadResult,
+} from "./media-sideload.js";
 
 interface RawWpMedia {
   id: number;
@@ -106,8 +112,18 @@ type GetMediaItemInput = z.infer<typeof GetMediaItemInputSchema>;
 // -----------------------------------------------------------------------------
 
 const UploadMediaInputSchema = z.object({
-  file_path: z.string().min(1)
-    .describe("Absolute path to a local file to upload. Must be readable by the MCP process. (For files in your workspace folder, use the full Windows path.)"),
+  source_url: z.string().url().optional()
+    .describe("Public https:// URL of the file. The WordPress site downloads it itself."),
+  drive_file_id: z.string().min(1).optional()
+    .describe("Google Drive file id. The site fetches it privately with the org's Google service account (the file or its Shared Drive must be shared with it). Best choice for files on the H: drive."),
+  base64_content: z.string().min(1).optional()
+    .describe("File bytes as base64 (a data: prefix is fine). Needs filename and sha256. Last resort: base64 relayed through a conversation can arrive truncated."),
+  filename: z.string().min(1).optional()
+    .describe("Filename with extension. Required with base64_content; optional otherwise (the extension is corrected to the real type)."),
+  sha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+    .describe("sha256 of the original file. Required with base64_content; checked if given for other sources."),
+  file_path: z.string().min(1).optional()
+    .describe("Path to a file on the CONNECTOR'S OWN HOST. On the hosted (Cloud Run) connector this is never your PC, so use drive_file_id or source_url instead."),
   title: z.string().optional()
     .describe("Title for the media item. Defaults to the filename minus extension."),
   alt_text: z.string().optional()
@@ -117,7 +133,13 @@ const UploadMediaInputSchema = z.object({
   description: z.string().optional()
     .describe("Longer description (rendered on the attachment page)."),
   post: z.number().int().min(0).optional()
-    .describe("Attach this media to a specific post/page ID. 0 (default) = unattached."),
+    .describe("Same as attach_to_post (kept for older callers)."),
+  attach_to_post: z.number().int().min(0).optional()
+    .describe("Attach this media to a post/page ID. 0 (default) = unattached."),
+  set_featured_on: z.array(z.number().int().positive()).max(50).optional()
+    .describe("Post IDs to set this image as the featured image on, e.g. a page, a Tickera event and its ticket products. Every id is checked before anything uploads."),
+  confirm_production: z.boolean().optional()
+    .describe("Required (true) on the LIVE site."),
   response_format: ResponseFormatField,
 }).strict();
 
@@ -262,25 +284,19 @@ Returns:
     "wp_upload_media",
     {
       title: "Upload File to WordPress Media Library",
-      description: `Upload a local file to the WP media library as a new attachment. Reads the file from file_path on the MCP host machine, sends as multipart/form-data, and returns the created media item.
+      description: `Add a file to the WordPress Media Library, and optionally make it the featured image on pages, events or products in the same call. No local file needed.
 
-Args:
-  - file_path (string): Absolute path to the file on disk. Required.
-  - title (string): Optional title (defaults to filename).
-  - alt_text (string): Optional alt text.
-  - caption (string): Optional caption.
-  - description (string): Optional description.
-  - post (number): Optional post/page ID to attach the media to (0 = unattached).
-  - response_format (enum): markdown | json. Default 'markdown'.
+Give exactly ONE source:
+  - drive_file_id: a Google Drive file id (best for anything on the H: drive). The site fetches it privately.
+  - source_url: a public https:// URL. The site downloads it.
+  - base64_content + filename + sha256: raw bytes. Last resort; base64 relayed through a conversation can arrive truncated.
+  - file_path: a file on the connector's OWN host. The hosted connector runs on Cloud Run, so this is never your PC.
 
-Returns:
-  The newly-created WPMediaItem with id, source_url, dimensions, etc.
+Options: title, alt_text (always set it for images), caption, description, attach_to_post (alias: post), set_featured_on (array of post ids), confirm_production (required on LIVE).
 
-Notes:
-  - The MCP host process must have read access to file_path.
-  - For best SEO, always pass alt_text on image uploads.
-  - WP MIME-sniffs the file; the upload will be rejected if the extension is on
-    WP's disallowed list (e.g. executables).`,
+Rules (enforced by the site's ars-nova-media plugin, route ans-ops/v1/media/sideload): 20 MB cap; JPEG, PNG, WebP, GIF, SVG or PDF only, judged from the file's bytes; unsafe SVG refused. Every post id is checked before anything uploads. file_path files of other types or over 20 MB fall back to the old wp/v2 upload (no set_featured_on).
+
+Returns the media id, source_url, the generated sizes, which posts it became featured on, and the site it landed on.`,
       inputSchema: UploadMediaInputSchema.shape,
       annotations: {
         readOnlyHint: false,
@@ -291,20 +307,47 @@ Notes:
     },
     async (params: UploadMediaInput) => {
       try {
-        const filePath = isAbsolute(params.file_path)
-          ? params.file_path
-          : resolvePath(process.cwd(), params.file_path);
+        const plan = planUpload(
+          {
+            ...params,
+            file_path: params.file_path
+              ? (isAbsolute(params.file_path) ? params.file_path : resolvePath(process.cwd(), params.file_path))
+              : undefined,
+          },
+          (p) => readFileSync(p)
+        );
+        if (plan.kind === "error") return toolError(plan.message);
 
-        let buffer: Buffer;
-        try {
-          buffer = readFileSync(filePath);
-        } catch (e) {
-          return toolError(
-            `Could not read file at '${filePath}': ${e instanceof Error ? e.message : String(e)}. ` +
-            `Use an absolute path readable by the MCP process.`
-          );
+        if (plan.kind === "sideload") {
+          // Direct client call rather than makeApiRequest: a base64 body for a
+          // 20 MB file is ~27 MB, over axios' default 10 MB request cap.
+          const response = await getWpClient().post(`/${SIDELOAD_ROUTE}`, plan.body, {
+            timeout: 180_000,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+          });
+          if (response.status === 404) {
+            return toolError(
+              "This site has no ans-ops/v1/media/sideload route. It needs the ars-nova-media plugin 1.2.0 or newer."
+            );
+          }
+          if (response.status >= 400) {
+            const body = response.data as { code?: string; message?: string } | undefined;
+            return toolError(
+              `Upload refused (HTTP ${response.status})${body?.code ? ` [${body.code}]` : ""}` +
+              `${body?.message ? `: ${body.message}` : ""}`
+            );
+          }
+          const result = response.data as SideloadResult;
+          const text = params.response_format === ResponseFormat.JSON
+            ? JSON.stringify(result, null, 2)
+            : formatSideloadMarkdown(result, plan.label);
+          return toolResult(text, result as unknown as Record<string, unknown>);
         }
 
+        // Legacy: a file on this host that the sideload route does not take.
+        const filePath = plan.filePath;
+        const buffer = readFileSync(filePath);
         const filename = basename(filePath);
         const mimeType = guessMimeType(filename);
 
@@ -314,7 +357,8 @@ Notes:
         if (params.alt_text !== undefined) form.append("alt_text", params.alt_text);
         if (params.caption !== undefined) form.append("caption", params.caption);
         if (params.description !== undefined) form.append("description", params.description);
-        if (params.post !== undefined) form.append("post", String(params.post));
+        const attachTo = params.attach_to_post ?? params.post;
+        if (attachTo !== undefined) form.append("post", String(attachTo));
 
         const client = getWpClient();
         const response = await client.post(`/${wpV2("media")}`, form, {

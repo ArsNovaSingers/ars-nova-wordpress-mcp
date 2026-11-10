@@ -97,3 +97,16 @@ test("markdown names the site, sizes and featured posts", () => {
   assert.match(md, /medium: 300x117/);
   assert.match(md, /7, 8 \(FAILED\)/);
 });
+
+test("schema accepts set_featured_on as text from clients with an old schema copy", async () => {
+  const { UploadMediaInputSchema } = await import("./media.js");
+  const parse = (v: unknown) => UploadMediaInputSchema.parse({ drive_file_id: "x", set_featured_on: v }).set_featured_on;
+  assert.deepEqual(parse([8084]), [8084]);
+  assert.deepEqual(parse("[8084, 8085]"), [8084, 8085]);
+  assert.deepEqual(parse("8084,8085"), [8084, 8085]);
+  assert.deepEqual(parse(8084), [8084]);
+  assert.throws(() => parse("abc"));
+  const cp = (v: unknown) => UploadMediaInputSchema.parse({ drive_file_id: "x", confirm_production: v }).confirm_production;
+  assert.equal(cp("false"), false);
+  assert.equal(cp(true), true);
+});

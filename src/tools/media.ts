@@ -134,14 +134,30 @@ const UploadMediaInputSchema = z.object({
     .describe("Longer description (rendered on the attachment page)."),
   post: z.number().int().min(0).optional()
     .describe("Same as attach_to_post (kept for older callers)."),
-  attach_to_post: z.number().int().min(0).optional()
+  attach_to_post: z.coerce.number().int().min(0).optional()
     .describe("Attach this media to a post/page ID. 0 (default) = unattached."),
-  set_featured_on: z.array(z.number().int().positive()).max(50).optional()
+  // A client holding an older copy of this schema sends arrays as text
+  // ("[8084]" or "8084,8085"), so accept those too.
+  set_featured_on: z.preprocess(
+    (v) => {
+      if (typeof v === "number") return [v];
+      if (typeof v !== "string") return v;
+      const s = v.trim();
+      if (s.startsWith("[")) { try { return JSON.parse(s); } catch { return v; } }
+      return s === "" ? [] : s.split(",").map((x) => Number(x.trim()));
+    },
+    z.array(z.coerce.number().int().positive()).max(50)
+  ).optional()
     .describe("Post IDs to set this image as the featured image on, e.g. a page, a Tickera event and its ticket products. Every id is checked before anything uploads."),
-  confirm_production: z.boolean().optional()
+  confirm_production: z.preprocess(
+    (v) => (v === "true" ? true : v === "false" ? false : v),
+    z.boolean()
+  ).optional()
     .describe("Required (true) on the LIVE site."),
   response_format: ResponseFormatField,
 }).strict();
+
+export { UploadMediaInputSchema };
 
 const UpdateMediaInputSchema = z.object({
   id: z.number().int().positive()

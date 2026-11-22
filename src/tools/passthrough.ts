@@ -30,6 +30,7 @@ const ALLOWED_NAMESPACES = [
   "ans-ops/v1",  // ars-nova-ops (plugin installer)
   "ans-notes/v1", // ars-nova-site-notes
   "ansg/v1",     // ars-nova-google-connector
+  "ccn/v1",      // ccn-core (Colorado Choral Network site plugin, ColoradoChoralNetwork/choralnetwork-site)
 ] as const;
 
 const CallSchema = z.object({
@@ -56,7 +57,7 @@ export function registerPassthroughTools(server: McpServer): void {
       title: "Call an Ars Nova plugin REST route",
       description: `Call any route in one of the Ars Nova plugins' own REST namespaces. Use this for capabilities that have no dedicated tool yet — it means a new plugin endpoint is usable the moment it is deployed, with no connector rebuild.
 
-RESTRICTED BY DESIGN to namespaces we author: ars-nova/v1, ans-ops/v1, ans-notes/v1, ansg/v1. It cannot call wp/v2, wc/v3 or third-party plugin routes — those have their own purpose-built tools with validation this does not provide.
+RESTRICTED BY DESIGN to namespaces we author: ars-nova/v1, ans-ops/v1, ans-notes/v1, ansg/v1, ccn/v1. It cannot call wp/v2, wc/v3 or third-party plugin routes — those have their own purpose-built tools with validation this does not provide.
 
 Environment safety: this goes through the same client as every other tool, so it hits whichever site this connector is configured for. Call wp_check_environment first if you are unsure whether you are on DEV or LIVE.
 
@@ -73,6 +74,13 @@ Useful ars-nova/v1 routes (ars-nova-ticketing-bridge v1.4.0):
   - POST tickera/event-categories        — { name, slug?, description?, ans_page_id? }
   - POST tickera/event-category/{id}     — rename, re-describe, re-link, reassign events
   - GET  tickera/attendees               — issued tickets
+
+Useful ccn/v1 routes (ccn-core; only on the Colorado Choral Network connectors, other sites return 404):
+  - GET  hub                             — upcoming concerts and listed groups (public)
+  - GET  concert/{slug} | org/{slug}/status
+  - POST org/{slug}/director/event       — create a concert for a group
+  - POST org/{slug}/director/event/{id}  — update it; add /guests or /cancel for those actions
+  Director routes let a site admin through without the group's X-CCN-Key, so they work when this connector logs in as an administrator.
 
 Args:
   - namespace (enum): one of the allowed namespaces. Required.

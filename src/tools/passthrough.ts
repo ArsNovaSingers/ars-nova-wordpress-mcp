@@ -30,6 +30,7 @@ const ALLOWED_NAMESPACES = [
   "ans-ops/v1",  // ars-nova-ops (plugin installer)
   "ans-notes/v1", // ars-nova-site-notes
   "ansg/v1",     // ars-nova-google-connector
+  "ans-comp/v1", // ans-comp-tickets (Door app, Door iPad, vouchers; admin-only routes, TKT-80)
 ] as const;
 
 const CallSchema = z.object({
@@ -56,7 +57,7 @@ export function registerPassthroughTools(server: McpServer): void {
       title: "Call an Ars Nova plugin REST route",
       description: `Call any route in one of the Ars Nova plugins' own REST namespaces. Use this for capabilities that have no dedicated tool yet — it means a new plugin endpoint is usable the moment it is deployed, with no connector rebuild.
 
-RESTRICTED BY DESIGN to namespaces we author: ars-nova/v1, ans-ops/v1, ans-notes/v1, ansg/v1. It cannot call wp/v2, wc/v3 or third-party plugin routes — those have their own purpose-built tools with validation this does not provide.
+RESTRICTED BY DESIGN to namespaces we author: ars-nova/v1, ans-ops/v1, ans-notes/v1, ansg/v1, ans-comp/v1. (ans-door-sales' routes - door-sale, door-checkin - are under ars-nova/v1.) It cannot call wp/v2, wc/v3 or third-party plugin routes — those have their own purpose-built tools with validation this does not provide.
 
 Environment safety: this goes through the same client as every other tool, so it hits whichever site this connector is configured for. Call wp_check_environment first if you are unsure whether you are on DEV or LIVE.
 
@@ -73,6 +74,15 @@ Useful ars-nova/v1 routes (ars-nova-ticketing-bridge v1.4.0):
   - POST tickera/event-categories        — { name, slug?, description?, ans_page_id? }
   - POST tickera/event-category/{id}     — rename, re-describe, re-link, reassign events
   - GET  tickera/attendees               — issued tickets
+
+Useful ans-comp/v1 routes (ans-comp-tickets 0.28.0, admin only; writes on LIVE also need confirm_production: true in the body):
+  - GET  door/app/productions            — every production: first night, works-until, door link state and URL, last emailed
+  - POST door/app/link                   — { production_id, action: make | rotate | cancel }; returns the link URL; cancel signs out its devices
+  - POST door/app/email                  — { production_id }: email the door link to the recipients now
+  - GET|POST door/app/recipients         — who gets the door link by email
+  - GET  door/app/devices                — devices signed in (?production_id=); POST door/app/devices/{id}/signout
+  - GET  door/ipad                       — Door iPad status, last seen, pairing URL; POST door/ipad/rotate
+  - GET  vouchers?project_id=            — vouchers (no., code, tickets claimed, status, guest); POST vouchers { project_id, count, tickets_per_voucher }
 
 Args:
   - namespace (enum): one of the allowed namespaces. Required.
